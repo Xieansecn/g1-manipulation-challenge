@@ -126,12 +126,16 @@ class G1Controller:
 
     # Right hand grip state
     self.grip_closed = False
+    self.block_attached = False
+    self.attach_distance = 0.08
+    self.attach_height_tolerance = 0.08
 
     self._build_joint_mappings()
     self._build_reacher_mappings()
     self._compute_pd_gains()
     self._cache_actuator_ids()
     self._cache_finger_actuators()
+    self._cache_block_ids()
 
     print("\n=== G1 Table Red Block Controller ===")
     print("  .         : Toggle WALK / REACH mode")
@@ -226,6 +230,10 @@ class G1Controller:
     # Grip toggle (works in any mode)
     if key == self.KEY_COMMA_GRIP:
       self.grip_closed = not self.grip_closed
+      if self.grip_closed:
+        self._try_attach_block()
+      else:
+        self._release_block()
       print(f"[GRIP] Right hand: {'CLOSED' if self.grip_closed else 'OPEN'}")
       return
 
@@ -436,30 +444,94 @@ class G1Controller:
       )
 
   def _cache_finger_actuators(self):
-    """Cache right hand finger actuator IDs and their closed targets."""
-    # (actuator_id, closed_position) — targets at joint limits for a power grasp
+    """Cache right claw actuator IDs and their open/closed targets."""
     self.right_finger_actuators = []
+    finger_open = {
+      "right_claw_top_mid_joint": 0.02,
+      "right_claw_top_tip_joint": 0.05,
+      "right_claw_upper_mid_joint": 0.02,
+      "right_claw_upper_tip_joint": 0.05,
+      "right_claw_lower_mid_joint": 0.02,
+      "right_claw_lower_tip_joint": 0.05,
+    }
     finger_closed = {
-      "right_hand_thumb_0_joint":  0.8,     # curl thumb inward
-      "right_hand_thumb_1_joint": -0.9,     # flex thumb
-      "right_hand_thumb_2_joint": -1.5,     # curl thumb tip
-      "right_hand_index_0_joint":  1.4,     # curl index
-      "right_hand_index_1_joint":  1.5,     # curl index tip
-      "right_hand_middle_0_joint": 1.4,     # curl middle
-      "right_hand_middle_1_joint": 1.5,     # curl middle tip
+      "right_claw_top_mid_joint": 0.50,
+      "right_claw_top_tip_joint": 0.80,
+      "right_claw_upper_mid_joint": 0.50,
+      "right_claw_upper_tip_joint": 0.80,
+      "right_claw_lower_mid_joint": 0.50,
+      "right_claw_lower_tip_joint": 0.80,
     }
     for name, closed_val in finger_closed.items():
       aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
       if aid >= 0:
-        self.right_finger_actuators.append((aid, closed_val))
+        self.right_finger_actuators.append((aid, finger_open[name], closed_val))
+
+  def _cache_block_ids(self):
+    self.red_block_body_id = mujoco.mj_name2id(
+      self.model, mujoco.mjtObj.mjOBJ_BODY, "red_block"
+    )
+    self.red_block_joint_id = mujoco.mj_name2id(
+      self.model, mujoco.mjtObj.mjOBJ_JOINT, "red_block_joint"
+    )
+    self.red_block_qpos_adr = self.model.jnt_qposadr[self.red_block_joint_id]
+    self.red_block_qvel_adr = self.model.jnt_dofadr[self.red_block_joint_id]
+
+  def _get_block_pos(self):
+    return self.data.xpos[self.red_block_body_id].copy()
+
+  def _get_palm_world_pose(self):
+    pos = self.data.site_xpos[self.right_palm_site_id].copy()
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(
+      quat, self.data.site_xmat[self.right_palm_site_id].reshape(3, 3).flatten()
+    )
+    return pos, quat
+
+  def _try_attach_block(self):
+    palm_pos, palm_quat = self._get_palm_world_pose()
+    block_pos = self._get_block_pos()
+    delta = block_pos - palm_pos
+    lateral_dist = np.linalg.norm(delta[:2])
+    vertical_dist = abs(delta[2])
+    if lateral_dist <= self.attach_distance and vertical_dist <= self.attach_height_tolerance:
+      self.block_attached = True
+      self._move_attached_block(palm_pos, palm_quat)
+      print("[GRIP] Block attached")
+    else:
+      print(
+        f"[GRIP] Block not attached (xy={lateral_dist:.3f}, z={vertical_dist:.3f})"
+      )
+
+  def _release_block(self):
+    if not self.block_attached:
+      return
+    self.block_attached = False
+    qvel_adr = self.red_block_qvel_adr
+    self.data.qvel[qvel_adr:qvel_adr + 6] = 0.0
+    print("[GRIP] Block released")
+
+  def _move_attached_block(self, palm_pos, palm_quat):
+    qpos_adr = self.red_block_qpos_adr
+    qvel_adr = self.red_block_qvel_adr
+    # The right_palm site now sits near the claw center.
+    attach_offset = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    world_offset = np.zeros(3, dtype=np.float64)
+    mujoco.mju_rotVecQuat(world_offset, attach_offset, palm_quat)
+    self.data.qpos[qpos_adr:qpos_adr + 3] = palm_pos + world_offset
+    self.data.qpos[qpos_adr + 3:qpos_adr + 7] = palm_quat
+    self.data.qvel[qvel_adr:qvel_adr + 6] = 0.0
 
   def apply_pd_control(self, target_pos):
     for i, act_id in enumerate(self.actuator_ids):
       if act_id >= 0:
         self.data.ctrl[act_id] = target_pos[i]
     # Apply grip
-    for act_id, closed_val in self.right_finger_actuators:
-      self.data.ctrl[act_id] = closed_val if self.grip_closed else 0.0
+    for act_id, open_val, closed_val in self.right_finger_actuators:
+      self.data.ctrl[act_id] = closed_val if self.grip_closed else open_val
+    if self.block_attached:
+      palm_pos, palm_quat = self._get_palm_world_pose()
+      self._move_attached_block(palm_pos, palm_quat)
 
 
 # --------------------------------------------------------------------------- #
@@ -530,7 +602,8 @@ def main():
   data = mujoco.MjData(model)
 
   # Init robot pose — spawn behind the table, facing it
-  data.qpos[0] = -0.6  # x: back from table
+  data.qpos[0] = -0.45  # x: closer to the near edge of the table
+  data.qpos[1] = 0.18   # y: shift left so the right hand lines up with the cylinder
   data.qpos[2] = 0.76
   data.qpos[3:7] = [1, 0, 0, 0]
   for name, value in config["default_joint_pos"].items():
@@ -636,7 +709,8 @@ def main():
       # Handle spacebar reset
       if state["reset"]:
         mujoco.mj_resetData(model, data)
-        data.qpos[0] = -0.6
+        data.qpos[0] = -0.45
+        data.qpos[1] = 0.18
         data.qpos[2] = 0.76
         data.qpos[3:7] = [1, 0, 0, 0]
         for name, value in config["default_joint_pos"].items():
