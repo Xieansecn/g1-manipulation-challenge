@@ -83,7 +83,7 @@ class G1Controller:
   KEY_KP_8, KEY_KP_2, KEY_KP_6, KEY_KP_4, KEY_KP_7, KEY_KP_1, KEY_KP_5 = (
     328, 322, 326, 324, 327, 321, 325
   )
-  KEY_U, KEY_J, KEY_Y, KEY_H, KEY_9, KEY_0, KEY_R = 85, 74, 89, 72, 57, 48, 82
+  KEY_U, KEY_J, KEY_Y, KEY_H, KEY_9, KEY_0, KEY_R, KEY_G = 85, 74, 89, 72, 57, 48, 82, 71
   KEY_COMMA_GRIP = 44  # , = Grip toggle
 
   WALKER_HEIGHT = 0.80
@@ -113,12 +113,31 @@ class G1Controller:
 
     # Reach state
     self.reach_active = False
-    self.reach_target = np.array([0.3, -0.2, 0.2], dtype=np.float32)
+    self.reach_target = np.array([0.3, -0.15, -0.12], dtype=np.float32)
     self.reach_orientation = np.zeros(3, dtype=np.float32)
     self.reach_step = 0.05
     self.last_arm_action = np.zeros(7, dtype=np.float32)
     self.last_arm_target = None
-    self.arm_max_delta = 0.012
+    self.arm_max_delta = 0.010
+    self.top_down_grasp_active = False
+    self.grip_target_closed = False
+    self.grip_close_rate = 0.012
+    self.grip_open_rate = 0.008
+    self.reach_transition_start = None
+    self.reach_joint_rates = np.array([
+      0.010,
+      0.010,
+      0.010,
+      0.008,
+      0.006,
+      0.006,
+      0.006,
+    ], dtype=np.float32)
+    # Auto-grasp state machine
+    self.auto_grasp_active = False
+    self.auto_grasp_phase = "idle"
+    self.auto_grasp_phase_steps = 0
+    self.auto_grasp_fixed_target = None
     # Frozen arm position — holds the last reach position when switching to walk
     self.frozen_arm_pos = None  # None = use defaults, array = hold position
 
@@ -133,6 +152,19 @@ class G1Controller:
     self._cache_actuator_ids()
     self._cache_finger_actuators()
 
+    self.red_block_body_id = mujoco.mj_name2id(
+      self.model, mujoco.mjtObj.mjOBJ_BODY, "red_block"
+    )
+    self.red_block_joint_id = mujoco.mj_name2id(
+      self.model, mujoco.mjtObj.mjOBJ_JOINT, "red_block_joint"
+    )
+
+    # Virtual attachment state
+    self.attached_block = False
+    self.attach_range = 0.15
+    self.attached_offset = None
+    self.attached_body_id = None
+
     print("\n=== G1 Table Red Block Controller ===")
     print("  .         : Toggle WALK / REACH mode")
     print("  --- WALK mode ---")
@@ -143,6 +175,8 @@ class G1Controller:
     print("  Up/Down   : Reach forward / backward")
     print("  Left/Right: Reach left / right")
     print("  ; / '     : Reach up / down")
+    print("  G         : Toggle top-down wrist pose")
+    print("  H         : Auto-grasp (track → grip → lift)")
     print("  \\         : Reset reach to default")
     print("  --- Always ---")
     print("  ,         : Toggle grip (close/open right hand)")
@@ -225,8 +259,36 @@ class G1Controller:
   def key_callback(self, key: int) -> None:
     # Grip toggle (works in any mode)
     if key == self.KEY_COMMA_GRIP:
-      self.grip_closed = not self.grip_closed
-      print(f"[GRIP] Right hand: {'CLOSED' if self.grip_closed else 'OPEN'}")
+      self.grip_target_closed = not self.grip_target_closed
+      if self.grip_target_closed:
+        self._try_attach_block()
+      else:
+        self._release_block()
+      print(f"[GRIP] Right hand target: {'CLOSED' if self.grip_target_closed else 'OPEN'}")
+      return
+
+    if self.auto_grasp_active and key not in (self.KEY_H, 32):
+      return
+
+    if key == self.KEY_G:
+      if self.right_reacher_policy is None:
+        print("[WARN] No right reacher policy loaded")
+        return
+      if self.top_down_grasp_active:
+        self._set_reach_default_pose()
+        self.top_down_grasp_active = False
+        print("[GRASP] Wrist orientation reset to default (G)")
+      else:
+        self._set_top_down_grasp_pose()
+        self.top_down_grasp_active = True
+        print("[GRASP] Top-down wrist pose set (G)")
+      return
+
+    if key == self.KEY_H:
+      if self.auto_grasp_active:
+        self._cancel_auto_grasp()
+        return
+      self._start_auto_grasp()
       return
 
     # Toggle input mode
@@ -237,18 +299,19 @@ class G1Controller:
       if self.input_mode == "walk":
         self.input_mode = "reach"
         self.reach_active = True
-        # Init reach target to a sensible default in front of pelvis
-        self.reach_target[:] = [0.3, -0.2, 0.2]
-        self.reach_orientation[:] = 0.0
-        self.last_arm_target = self._get_arm_joint_positions() + self.arm_default_pos
-        print("[MODE] >>> REACH — arrows move hand, ;/' = up/down, \\ = reset target")
+        self.reach_target[:] = [0.3, -0.15, 0.05]
+        self.frozen_arm_pos = None
+        if not self.top_down_grasp_active:
+          self._set_reach_default_pose()
+        self._start_reach_transition()
+        print("[MODE] >>> REACH — arrows move hand, ;/' = up/down")
       else:
         self.input_mode = "walk"
         self.reach_active = False
-        # Freeze arm where it is — read current right arm joint positions
         if self.last_arm_target is not None:
           self.frozen_arm_pos = self.last_arm_target.copy()
         self.last_arm_target = None
+        self.reach_transition_start = None
         print("[MODE] >>> WALK — arm holds position, arrows move robot")
       return
 
@@ -293,13 +356,38 @@ class G1Controller:
     elif key == self.KEY_APOSTROPHE:
       self.reach_target[2] = np.clip(self.reach_target[2] - self.reach_step, -0.4, 0.6)
     elif key == self.KEY_BACKSLASH or key == self.KEY_SLASH:
-      self.reach_target[:] = [0.3, -0.2, 0.2]
-      self.reach_orientation[:] = 0.0
+      self.reach_target[:] = [0.3, -0.15, -0.12]
+      self._set_reach_default_pose()
       print("[REACH] Target reset to default")
+      return
+    elif key == self.KEY_R:
+      self._set_reach_default_pose()
+      self.top_down_grasp_active = False
+      print("[REACH] Orientation reset to default")
       return
     else:
       return
     print(f"[REACH] target: fwd={self.reach_target[0]:.2f} side={self.reach_target[1]:.2f} up={self.reach_target[2]:.2f}")
+
+  def _set_reach_default_pose(self):
+    self.reach_orientation[:] = 0.0
+
+  def _set_top_down_grasp_pose(self):
+    # If the hand points the wrong way in your scene, flip the pitch sign.
+    self.reach_orientation[:] = [0.0, -np.pi / 2, 0.0]
+
+  def _start_reach_transition(self):
+    self.last_arm_target = self._get_arm_joint_positions() + self.arm_default_pos
+    self.reach_transition_start = self.last_arm_target.copy()
+
+  def _apply_top_down_grasp_pose(self, target_pos):
+    # Point the claw axis straight down (parallel to cylinder axis)
+    wrist_roll_idx = self.joint_names.index("right_wrist_roll_joint")
+    wrist_pitch_idx = self.joint_names.index("right_wrist_pitch_joint")
+    wrist_yaw_idx = self.joint_names.index("right_wrist_yaw_joint")
+    target_pos[wrist_roll_idx] = 0.0
+    target_pos[wrist_pitch_idx] = 1.57
+    target_pos[wrist_yaw_idx] = 0.0
 
   # --- State helpers ---
   def _get_base_pose(self):
@@ -399,6 +487,9 @@ class G1Controller:
       for i, full_idx in enumerate(self.right_arm_indices):
         target_pos[full_idx] = self.frozen_arm_pos[i]
 
+    if self.auto_grasp_active:
+      self._update_auto_grasp()
+
     # Right arm reacher overlay (when in reach mode)
     if self.reach_active and self.right_reacher_policy is not None:
       reacher_obs = np.concatenate([
@@ -416,13 +507,29 @@ class G1Controller:
       arm_target = self.arm_default_pos + arm_action * self.arm_action_scales
 
       if self.last_arm_target is not None:
-        delta = np.clip(arm_target - self.last_arm_target, -self.arm_max_delta, self.arm_max_delta)
+        max_delta = 0.025 if self.auto_grasp_active else self.arm_max_delta
+        delta = np.clip(arm_target - self.last_arm_target, -max_delta, max_delta)
         arm_target = self.last_arm_target + delta
       self.last_arm_target = arm_target.copy()
 
       for i, full_idx in enumerate(self.right_arm_indices):
         target_pos[full_idx] = arm_target[i]
+      if self.reach_transition_start is not None:
+        for i, full_idx in enumerate(self.right_arm_indices):
+          current_target = target_pos[full_idx]
+          current_value = self.reach_transition_start[i]
+          max_step = self.reach_joint_rates[i]
+          delta = np.clip(current_target - current_value, -max_step, max_step)
+          target_pos[full_idx] = current_value + delta
+          self.reach_transition_start[i] = target_pos[full_idx]
       self.last_arm_action = arm_action.copy()
+
+    if self.top_down_grasp_active:
+      self._apply_top_down_grasp_pose(target_pos)
+      if self.reach_transition_start is not None:
+        self.reach_transition_start[4] = target_pos[self.right_arm_indices[4]]
+        self.reach_transition_start[5] = target_pos[self.right_arm_indices[5]]
+        self.reach_transition_start[6] = target_pos[self.right_arm_indices[6]]
 
     self.last_action = action.copy()
     return target_pos
@@ -436,30 +543,172 @@ class G1Controller:
       )
 
   def _cache_finger_actuators(self):
-    """Cache right hand finger actuator IDs and their closed targets."""
-    # (actuator_id, closed_position) — targets at joint limits for a power grasp
+    """Cache right claw actuator IDs and their open/closed targets."""
     self.right_finger_actuators = []
+    finger_open = {
+      "right_claw_top_mid_joint": 0.3,
+      "right_claw_upper_mid_joint": 0.3,
+      "right_claw_lower_mid_joint": 0.3,
+    }
     finger_closed = {
-      "right_hand_thumb_0_joint":  0.8,     # curl thumb inward
-      "right_hand_thumb_1_joint": -0.9,     # flex thumb
-      "right_hand_thumb_2_joint": -1.5,     # curl thumb tip
-      "right_hand_index_0_joint":  1.4,     # curl index
-      "right_hand_index_1_joint":  1.5,     # curl index tip
-      "right_hand_middle_0_joint": 1.4,     # curl middle
-      "right_hand_middle_1_joint": 1.5,     # curl middle tip
+      "right_claw_top_mid_joint": 0.0,
+      "right_claw_upper_mid_joint": 0.0,
+      "right_claw_lower_mid_joint": 0.0,
     }
     for name, closed_val in finger_closed.items():
       aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
       if aid >= 0:
-        self.right_finger_actuators.append((aid, closed_val))
+        self.right_finger_actuators.append((aid, finger_open[name], closed_val))
+
+  def _try_attach_block(self):
+    if self.attached_block:
+      return
+    if not self.grip_target_closed:
+      return
+    dist = self._get_palm_to_block_distance()
+    if dist < self.attach_range:
+      palm_pos = self.data.site_xpos[self.right_palm_site_id].copy()
+      block_pos = self.data.xpos[self.red_block_body_id].copy()
+      self.attached_offset = block_pos - palm_pos
+      self.attached_block = True
+      self.attached_body_id = self.red_block_body_id
+      print(f"[GRIP] Attached block (dist={dist:.3f}m)")
+
+  def _move_attached_block(self):
+    if not self.attached_block or self.attached_body_id is None:
+      return
+    palm_pos = self.data.site_xpos[self.right_palm_site_id]
+    new_block_pos = palm_pos + self.attached_offset
+    jnt_adr = self.model.jnt_qposadr[self.red_block_joint_id]
+    self.data.qpos[jnt_adr:jnt_adr + 3] = new_block_pos
+    vel_adr = self.model.jnt_dofadr[self.red_block_joint_id]
+    self.data.qvel[vel_adr:vel_adr + 7] = 0.0
+    mujoco.mj_forward(self.model, self.data)
+
+  def _release_block(self):
+    if self.attached_block:
+      self.attached_block = False
+      self.attached_offset = None
+      self.attached_body_id = None
+      print("[GRIP] Released block")
+
+  def _get_block_world_pos(self):
+    return self.data.xpos[self.red_block_body_id].copy()
+
+  def _get_palm_to_block_distance(self):
+    palm_pos = self.data.site_xpos[self.right_palm_site_id]
+    block_pos = self.data.xpos[self.red_block_body_id]
+    return float(np.linalg.norm(palm_pos - block_pos))
+
+  def _update_auto_grasp(self):
+    if not self.auto_grasp_active:
+      return
+
+    pelvis_pos, pelvis_quat = self._get_base_pose()
+    block_world = self._get_block_world_pos()
+    block_in_pelvis = self._quat_apply_inverse(pelvis_quat, block_world - pelvis_pos)
+    dist = self._get_palm_to_block_distance()
+    self.auto_grasp_phase_steps += 1
+
+    if self.auto_grasp_phase == "reach":
+      self.reach_target[:] = np.clip(
+        block_in_pelvis + np.array([-0.02, 0.0, 0.06], dtype=np.float32),
+        [-0.3, -0.6, -0.4], [0.6, 0.3, 0.6],
+      )
+      if dist < 0.15:
+        self._enter_phase("orient")
+        print(f"[AUTO-GRASP] Hand close (dist={dist:.3f}m), orienting wrist")
+
+    elif self.auto_grasp_phase == "orient":
+      self._set_top_down_grasp_pose()
+      self.top_down_grasp_active = True
+      self.reach_target[:] = np.clip(
+        block_in_pelvis + np.array([-0.02, 0.0, 0.04], dtype=np.float32),
+        [-0.3, -0.6, -0.4], [0.6, 0.3, 0.6],
+      )
+      if self.auto_grasp_phase_steps % 20 == 0:
+        palm_pelvis = self._get_palm_pos_in_pelvis()
+        print(f"[AUTO-GRASP] orient dist={dist:.3f}m palm_pelvis=({palm_pelvis[0]:.2f},{palm_pelvis[1]:.2f},{palm_pelvis[2]:.2f})")
+      if dist < 0.10 or self.auto_grasp_phase_steps > 200:
+        self.auto_grasp_fixed_target = block_in_pelvis.copy()
+        self._enter_phase("close_wait")
+        self.grip_target_closed = True
+        print(f"[AUTO-GRASP] Closing grip (dist={dist:.3f}m)")
+
+    elif self.auto_grasp_phase == "close_wait":
+      if self.auto_grasp_fixed_target is not None:
+        self.reach_target[:] = np.clip(
+          self.auto_grasp_fixed_target,
+          [-0.3, -0.6, -0.4], [0.6, 0.3, 0.6],
+        )
+      if self.auto_grasp_phase_steps >= 60:
+        self._try_attach_block()
+      if self.auto_grasp_phase_steps >= 100:
+        self._enter_phase("lift")
+        print("[AUTO-GRASP] Grip closed, lifting cylinder")
+
+    elif self.auto_grasp_phase == "lift":
+      if self.auto_grasp_fixed_target is not None:
+        self.auto_grasp_fixed_target[2] += 0.003
+        self.reach_target[:] = np.clip(
+          self.auto_grasp_fixed_target,
+          [-0.3, -0.6, -0.4], [0.6, 0.3, 0.6],
+        )
+        if self.reach_target[2] >= 0.25:
+          self._enter_phase("done")
+          print("[AUTO-GRASP] Lift complete — holding")
+
+  def _enter_phase(self, phase):
+    self.auto_grasp_phase = phase
+    self.auto_grasp_phase_steps = 0
+
+  def _start_auto_grasp(self):
+    if self.right_reacher_policy is None:
+      print("[WARN] No right reacher policy loaded")
+      return
+    self.input_mode = "reach"
+    self.reach_active = True
+    self.frozen_arm_pos = None
+    self._set_reach_default_pose()
+    self.top_down_grasp_active = False
+    self.last_arm_target = self._get_arm_joint_positions() + self.arm_default_pos
+    self.reach_transition_start = None
+    self.grip_target_closed = False
+    self._release_block()
+    self.auto_grasp_active = True
+    self._enter_phase("reach")
+    self.auto_grasp_phase_steps = 0
+    block_world = self._get_block_world_pos()
+    print(f"[AUTO-GRASP] Started — block at world {block_world[0]:.2f},{block_world[1]:.2f},{block_world[2]:.2f}")
+    print("[AUTO-GRASP] Phase: reach — extending arm to cylinder")
+
+  def _cancel_auto_grasp(self):
+    self.auto_grasp_active = False
+    self.auto_grasp_phase = "idle"
+    self.auto_grasp_phase_steps = 0
+    self.auto_grasp_fixed_target = None
+    self._release_block()
+    print("[AUTO-GRASP] Cancelled")
+
+  def _get_palm_world_pose(self):
+    pos = self.data.site_xpos[self.right_palm_site_id].copy()
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(
+      quat, self.data.site_xmat[self.right_palm_site_id].reshape(3, 3).flatten()
+    )
+    return pos, quat
 
   def apply_pd_control(self, target_pos):
     for i, act_id in enumerate(self.actuator_ids):
       if act_id >= 0:
         self.data.ctrl[act_id] = target_pos[i]
     # Apply grip
-    for act_id, closed_val in self.right_finger_actuators:
-      self.data.ctrl[act_id] = closed_val if self.grip_closed else 0.0
+    for act_id, open_val, closed_val in self.right_finger_actuators:
+      current_val = self.data.ctrl[act_id]
+      target_val = closed_val if self.grip_target_closed else open_val
+      step = self.grip_close_rate if self.grip_target_closed else self.grip_open_rate
+      delta = np.clip(target_val - current_val, -step, step)
+      self.data.ctrl[act_id] = current_val + delta
 
 
 # --------------------------------------------------------------------------- #
@@ -530,7 +779,8 @@ def main():
   data = mujoco.MjData(model)
 
   # Init robot pose — spawn behind the table, facing it
-  data.qpos[0] = -0.6  # x: back from table
+  data.qpos[0] = -0.40  # x: move back from table
+  data.qpos[1] = 0.18   # y: shift left so the right hand lines up with the cylinder
   data.qpos[2] = 0.76
   data.qpos[3:7] = [1, 0, 0, 0]
   for name, value in config["default_joint_pos"].items():
@@ -636,7 +886,8 @@ def main():
       # Handle spacebar reset
       if state["reset"]:
         mujoco.mj_resetData(model, data)
-        data.qpos[0] = -0.6
+        data.qpos[0] = -0.40
+        data.qpos[1] = 0.18
         data.qpos[2] = 0.76
         data.qpos[3:7] = [1, 0, 0, 0]
         for name, value in config["default_joint_pos"].items():
@@ -649,7 +900,14 @@ def main():
         ctrl.reach_active = False
         ctrl.last_arm_target = None
         ctrl.frozen_arm_pos = None
-        ctrl.grip_closed = False
+        ctrl.top_down_grasp_active = False
+        ctrl.grip_target_closed = False
+        ctrl._release_block()
+        ctrl.reach_transition_start = None
+        ctrl.auto_grasp_active = False
+        ctrl.auto_grasp_phase = "idle"
+        ctrl.auto_grasp_phase_steps = 0
+        ctrl.auto_grasp_fixed_target = None
         ctrl.input_mode = "walk"
         target_pos = ctrl.default_joint_pos.copy()
         state["reset"] = False
@@ -665,6 +923,7 @@ def main():
           target_pos = ctrl.step()
         ctrl.apply_pd_control(target_pos)
         mujoco.mj_step(model, data)
+        ctrl._move_attached_block()
         control_step += 1
         sim_time += model.opt.timestep
 
